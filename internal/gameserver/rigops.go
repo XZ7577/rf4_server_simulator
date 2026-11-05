@@ -650,11 +650,11 @@ func (s *Server) setStackCount(ctx context.Context, row *store.Item, count int64
 	if q := fieldIdxByCS(row.WireClass, csQty); q >= 0 && q < len(fields) {
 		fields[q].Num = ptrU64(uint64(count))
 	}
+	bumpCreatedTicks(fields, row.WireClass)
 	fj, jerr := FieldsToJSON(fields)
 	if jerr != nil {
 		return
 	}
-	bumpCreatedTicks(fields, row.WireClass)
 	_ = s.DB.UpdateItemFields(ctx, row.GUID, fj, count, row.Durability, row.Workmanship, row.RigGUID)
 }
 
