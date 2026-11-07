@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"rf4server/internal/proto"
 	"rf4server/internal/store"
@@ -30,7 +31,7 @@ func hStoreList(ctx *Ctx) ([]byte, bool) {
 	}
 	cctx := ctx.Sess.pushCtx()
 	out := proto.Args(proto.S("140"))
-	items, err := srv.DB.ShopItems(cctx, storeID)
+	items, err := srv.shopItemsAt(cctx, storeID, time.Now())
 	if err != nil {
 		ctx.Log.Warn("读取商店货架失败", "store", storeID, "err", err)
 		items = nil
@@ -54,6 +55,10 @@ func hStoreList(ctx *Ctx) ([]byte, bool) {
 
 // storePrice 只接受该店生效货架上的价格，避免使用全局价格绕过店内库存。
 func (s *Server) storePrice(ctx context.Context, storeID, itemID string, clientOffer uint64, goldCol bool) (uint64, error) {
+	return s.storePriceAt(ctx, storeID, itemID, clientOffer, goldCol, time.Now())
+}
+
+func (s *Server) storePriceAt(ctx context.Context, storeID, itemID string, clientOffer uint64, goldCol bool, now time.Time) (uint64, error) {
 	_ = clientOffer // 客户端报价只用于诊断，绝不作为服务端成交价。
 	pick := func(p *store.ShopPrice) (uint64, error) {
 		if p == nil {
@@ -69,6 +74,9 @@ func (s *Server) storePrice(ctx context.Context, storeID, itemID string, clientO
 			return 0, fmt.Errorf("商品没有 %s 价格: %s@%s", cur, storeID, itemID)
 		}
 		return uint64(price), nil
+	}
+	if isFishingShop(storeID) && store.IsDiscontinuedShopItem(itemID) && !discontinuedShopOpenAt(now) {
+		return 0, errDiscontinuedShopClosed
 	}
 	p, err := s.DB.ShopItemGet(ctx, storeID, itemID)
 	if err != nil {
@@ -99,6 +107,12 @@ func (s *Server) prepareStoreGoods(ctx context.Context, uid int64, itemID string
 // 校验价格、构造物品，并在同一事务内扣款、记流水和入库。
 func hStoreBuy(goldCol bool) Handler {
 	return func(ctx *Ctx) ([]byte, bool) {
+		return hStoreBuyAt(goldCol, time.Now())(ctx)
+	}
+}
+
+func hStoreBuyAt(goldCol bool, now time.Time) Handler {
+	return func(ctx *Ctx) ([]byte, bool) {
 		srv := ctx.Sess.Srv
 		if !srv.requireDB(ctx) {
 			return nil, false
@@ -119,9 +133,14 @@ func hStoreBuy(goldCol bool) Handler {
 			offer = ints[0]
 		}
 		cctx := ctx.Sess.pushCtx()
-		price, err := srv.storePrice(cctx, storeID, itemID, offer, goldCol)
+		price, err := srv.storePriceAt(cctx, storeID, itemID, offer, goldCol, now)
 		if err != nil {
 			ctx.Log.Warn("商店拒绝购买", "store", storeID, "item", itemID, "gold", goldCol, "err", err)
+			if errors.Is(err, errDiscontinuedShopClosed) {
+				// 4.0.25034 operation result 129: 无法购买。该商品缺货。
+				ctx.ReplyOperationResult(129)
+				return nil, true
+			}
 			return fail("购买未完成，请刷新商店后重试")
 		}
 		prepared, isBundle, err := srv.prepareStoreGoods(cctx, uid, itemID)
@@ -252,13 +271,26 @@ func hStoreReturn(ctx *Ctx) ([]byte, bool) {
 	return body, true
 }
 
-// hStoreATMQuery 处理 22/6。实抓证据（2026-11-04 trace）：客户端在房产
+// hStoreATMQuery 处理 22/6 库存变更查询。客户端传店铺和上次加载时的
+// FILETIME，true 会使 bikcadfljfo.dfkgmpnnhia 重新加载货架。
+// 实抓证据（2026-11-04 trace）：客户端在房产
 // 购买流程中每次 3/33 之后都会发送 [store_id, filetime]，据此判断支付/
 // 结算是否完成；回 false 会让客户端停在购买界面循环。房产商店回 true
-// 放行结算；其余商店维持既有 false 行为，不影响 ATM 钱包商店。
+// 放行结算；钓鱼站按限时货架边界判断，其余商店保持 false。
 func hStoreATMQuery(ctx *Ctx) ([]byte, bool) {
-	if strs := treeStrs(ctx.Tree); len(strs) > 0 && strings.HasPrefix(strs[0], "housestore_") {
+	return hStoreQueryAt(ctx, time.Now())
+}
+
+func hStoreQueryAt(ctx *Ctx, now time.Time) ([]byte, bool) {
+	strs := treeStrs(ctx.Tree)
+	if len(strs) > 0 && strings.HasPrefix(strs[0], "housestore_") {
 		return []byte{0x0E}, true
+	}
+	if len(strs) > 0 && isFishingShop(strs[0]) {
+		ints := treeInts(ctx.Tree)
+		if len(ints) > 0 && discontinuedShopChangedSince(proto.FiletimeToTime(int64(ints[0])), now) {
+			return []byte{0x0E}, true
+		}
 	}
 	return []byte{0x0F}, true
 }
